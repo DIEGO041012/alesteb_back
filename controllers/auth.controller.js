@@ -1,0 +1,943 @@
+// controllers/auth.controller.js
+const db     = require("../config/db");
+const bcrypt = require("bcryptjs");
+const jwt    = require("jsonwebtoken");
+const crypto = require("crypto");
+const { generateVerificationCode, sendVerificationEmail } = require("../config/emailConfig");
+
+// ============================================
+// 🔐 CONFIGURACIÓN DE SEGURIDAD
+// ============================================
+const SALT_ROUNDS              = 12;
+const JWT_ACCESS_EXPIRY        = "15m";
+const JWT_REFRESH_EXPIRY       = "7d";
+const MAX_LOGIN_ATTEMPTS       = 5;
+const LOCKOUT_TIME             = 15 * 60 * 1000;
+const VERIFICATION_CODE_EXPIRY = 10 * 60 * 1000;
+
+const isValidEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+
+const isStrongPassword = (password) =>
+  password.length >= 8 &&
+  /[A-Z]/.test(password) &&
+  /[a-z]/.test(password) &&
+  /[0-9]/.test(password) &&
+  /[^A-Za-z0-9]/.test(password);
+
+// ============================================
+// 🎫 GENERACIÓN DE TOKENS
+// ============================================
+const generateAccessToken = (payload) =>
+  jwt.sign(payload, process.env.JWT_SECRET, {
+    expiresIn: JWT_ACCESS_EXPIRY,
+    issuer:    "alesteb-api",
+    audience:  "alesteb-client",
+  });
+
+const generateRefreshToken = (payload) =>
+  jwt.sign(payload, process.env.JWT_REFRESH_SECRET, {
+    expiresIn: JWT_REFRESH_EXPIRY,
+    issuer:    "alesteb-api",
+    audience:  "alesteb-client",
+  });
+
+// ============================================
+// 📊 OBTENER ROLES
+// ============================================
+const getUserRoles = async (userId) => {
+  const client = await db.connect();
+  try {
+    const res = await client.query(
+      `SELECT r.name, r.id
+       FROM roles r
+       JOIN user_roles ur ON ur.role_id = r.id
+       WHERE ur.user_id = $1`,
+      [userId]
+    );
+    return {
+      roles:   res.rows.map((r) => r.name),
+      roleIds: res.rows.map((r) => r.id),
+    };
+  } finally {
+    client.release();
+  }
+};
+
+// ============================================
+// 🔑 HELPER: GUARDAR REFRESH TOKEN
+// ============================================
+const saveRefreshToken = async (client, userId, refreshToken, deviceInfo) => {
+  const tokenHash = crypto.createHash("sha256").update(refreshToken).digest("hex");
+  await client.query(
+    `INSERT INTO refresh_tokens (user_id, token_hash, device_info, expires_at)
+     VALUES ($1, $2, $3, NOW() + INTERVAL '7 days')
+     ON CONFLICT DO NOTHING`,
+    [userId, tokenHash, deviceInfo || "unknown"]
+  );
+};
+
+// ============================================
+// 🔓 LOGIN
+// ============================================
+exports.login = async (req, res) => {
+  const client = await db.connect();
+  try {
+    const { email, password, deviceInfo } = req.body;
+
+    // --- Validaciones básicas ---
+    if (!email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: "Email y contraseña son requeridos",
+        code: "MISSING_FIELDS",
+      });
+    }
+
+    if (!isValidEmail(email)) {
+      return res.status(400).json({
+        success: false,
+        message: "Formato de email inválido",
+        code: "INVALID_EMAIL",
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const userRes = await client.query(
+      `SELECT id, email, password, name, phone, cedula, city, address,
+              failed_login_attempts, locked_until, is_active, is_verified
+       FROM users WHERE email = $1`,
+      [email.toLowerCase().trim()]
+    );
+
+    // Siempre usar el mismo mensaje para credenciales incorrectas (seguridad)
+    if (userRes.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(401).json({
+        success: false,
+        message: "Credenciales inválidas",
+        code: "INVALID_CREDENTIALS",
+      });
+    }
+
+    const user = userRes.rows[0];
+
+    // --- Verificación de email ---
+    if (!user.is_verified) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({
+        success: false,
+        message: "Debes verificar tu email antes de iniciar sesión. Revisa tu bandeja de entrada.",
+        code: "EMAIL_NOT_VERIFIED",
+        email: user.email, // para que el frontend pueda ofrecer reenviar el código
+      });
+    }
+
+    // --- Cuenta activa ---
+    if (!user.is_active) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({
+        success: false,
+        message: "Cuenta desactivada. Contacta al administrador.",
+        code: "USER_INACTIVE",
+      });
+    }
+
+    // --- Cuenta bloqueada ---
+    if (user.locked_until && new Date(user.locked_until) > new Date()) {
+      await client.query("ROLLBACK");
+      const minutesLeft = Math.ceil((new Date(user.locked_until) - new Date()) / 60000);
+      return res.status(429).json({
+        success: false,
+        message: `Cuenta bloqueada temporalmente. Intenta en ${minutesLeft} minuto${minutesLeft !== 1 ? "s" : ""}.`,
+        code: "ACCOUNT_LOCKED",
+        retryAfter: minutesLeft,
+      });
+    }
+
+    // --- Validar contraseña ---
+    const isValidPassword = await bcrypt.compare(password, user.password);
+
+    if (!isValidPassword) {
+      const newAttempts = (user.failed_login_attempts || 0) + 1;
+      const attemptsLeft = MAX_LOGIN_ATTEMPTS - newAttempts;
+
+      if (newAttempts >= MAX_LOGIN_ATTEMPTS) {
+        const lockUntil = new Date(Date.now() + LOCKOUT_TIME);
+        await client.query(
+          `UPDATE users SET failed_login_attempts = $1, locked_until = $2 WHERE id = $3`,
+          [newAttempts, lockUntil, user.id]
+        );
+        await client.query("COMMIT");
+        return res.status(429).json({
+          success: false,
+          message: "Demasiados intentos fallidos. Cuenta bloqueada por 15 minutos.",
+          code: "ACCOUNT_LOCKED",
+          retryAfter: 15,
+        });
+      }
+
+      await client.query(
+        "UPDATE users SET failed_login_attempts = $1 WHERE id = $2",
+        [newAttempts, user.id]
+      );
+      await client.query("COMMIT");
+      return res.status(401).json({
+        success: false,
+        message: "Credenciales inválidas",
+        code: "INVALID_CREDENTIALS",
+        attemptsLeft: Math.max(0, attemptsLeft),
+      });
+    }
+
+    // --- Login exitoso ---
+    await client.query(
+      `UPDATE users SET failed_login_attempts = 0, locked_until = NULL, last_login = NOW() WHERE id = $1`,
+      [user.id]
+    );
+
+    const { roles } = await getUserRoles(user.id);
+    const tokenPayload = { id: user.id, email: user.email, name: user.name, roles };
+    const accessToken  = generateAccessToken(tokenPayload);
+    const refreshToken = generateRefreshToken({ id: user.id, email: user.email });
+
+    await saveRefreshToken(client, user.id, refreshToken, deviceInfo);
+    await client.query("COMMIT");
+
+    console.log(`[LOGIN SUCCESS] ${user.email} | Roles: ${roles.join(", ")}`);
+
+    return res.json({
+      success: true,
+      message: "Login exitoso",
+      user: {
+        id:      user.id,
+        email:   user.email,
+        name:    user.name || "Usuario",
+        phone:   user.phone,
+        cedula:  user.cedula,
+        city:    user.city,
+        address: user.address,
+        roles,
+      },
+      token: accessToken,
+      refreshToken,
+    });
+
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("[LOGIN ERROR]", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error en el servidor. Intenta nuevamente.",
+      code: "SERVER_ERROR",
+    });
+  } finally {
+    client.release();
+  }
+};
+
+// ============================================
+// 🛠️ SETUP — CREAR PRIMER ADMIN
+// Solo funciona si NO existe ningún admin en la BD
+// DELETE o deshabilita esta ruta en producción estable
+// ============================================
+exports.setupAdmin = async (req, res) => {
+  const client = await db.connect();
+  try {
+    const { email, password, name, secretKey } = req.body;
+
+    // Clave secreta de configuración (defínela en tu .env)
+    const SETUP_KEY = process.env.SETUP_SECRET_KEY || "alesteb-setup-2024";
+    if (secretKey !== SETUP_KEY) {
+      return res.status(403).json({
+        success: false,
+        message: "Clave de configuración inválida",
+        code: "INVALID_SETUP_KEY",
+      });
+    }
+
+    if (!email || !password || !name) {
+      return res.status(400).json({
+        success: false,
+        message: "Email, contraseña y nombre son requeridos",
+        code: "MISSING_FIELDS",
+      });
+    }
+
+    if (!isValidEmail(email)) {
+      return res.status(400).json({
+        success: false,
+        message: "Formato de email inválido",
+        code: "INVALID_EMAIL",
+      });
+    }
+
+    if (!isStrongPassword(password)) {
+      return res.status(400).json({
+        success: false,
+        message: "La contraseña debe tener mínimo 8 caracteres, mayúsculas, minúsculas, números y un carácter especial",
+        code: "WEAK_PASSWORD",
+      });
+    }
+
+    await client.query("BEGIN");
+
+    // Verificar que no exista ya un admin
+    const adminCheck = await client.query(
+      `SELECT u.id FROM users u
+       JOIN user_roles ur ON ur.user_id = u.id
+       JOIN roles r ON r.id = ur.role_id
+       WHERE r.name = 'admin' LIMIT 1`
+    );
+
+    if (adminCheck.rowCount > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        success: false,
+        message: "Ya existe un administrador en el sistema. Usa el login normal.",
+        code: "ADMIN_EXISTS",
+      });
+    }
+
+    // Verificar que el email no esté tomado
+    const emailCheck = await client.query(
+      "SELECT id FROM users WHERE email = $1",
+      [email.toLowerCase().trim()]
+    );
+
+    if (emailCheck.rowCount > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        success: false,
+        message: "El email ya está registrado",
+        code: "EMAIL_TAKEN",
+      });
+    }
+
+    // Asegurarse de que el rol 'admin' existe (id = 1 típicamente)
+    const adminRoleRes = await client.query(
+      "SELECT id FROM roles WHERE name = 'admin' LIMIT 1"
+    );
+
+    if (adminRoleRes.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(500).json({
+        success: false,
+        message: "El rol 'admin' no existe en la base de datos. Ejecuta las migraciones primero.",
+        code: "ROLE_NOT_FOUND",
+      });
+    }
+
+    const adminRoleId = adminRoleRes.rows[0].id;
+    if (!req.body.cedula) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        success: false,
+        message: "La cédula es requerida",
+        code: "MISSING_FIELDS",
+      });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
+
+    const userRes = await client.query(
+      `INSERT INTO users (email, password, name, cedula, is_active, is_verified)
+       VALUES ($1, $2, $3, $4, true, true)
+       RETURNING id, email, name`,
+      [email.toLowerCase().trim(), hashedPassword, name.trim(), req.body.cedula.trim()]
+    );
+
+    const newUser = userRes.rows[0];
+
+    await client.query(
+      "INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2)",
+      [newUser.id, adminRoleId]
+    );
+
+    await client.query("COMMIT");
+
+    console.log(`[SETUP ADMIN] Admin creado: ${newUser.email} (ID: ${newUser.id})`);
+
+    return res.status(201).json({
+      success: true,
+      message: "Administrador creado exitosamente. Ya puedes iniciar sesión.",
+      data: {
+        id:    newUser.id,
+        email: newUser.email,
+        name:  newUser.name,
+      },
+    });
+
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("[SETUP ADMIN ERROR]", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error al crear el administrador",
+      code: "SERVER_ERROR",
+    });
+  } finally {
+    client.release();
+  }
+};
+
+// ============================================
+// 🔄 VERIFICAR EMAIL Y CONVERTIR EN ADMIN (si es el primero)
+// ============================================
+exports.verifyEmail = async (req, res) => {
+  const client = await db.connect();
+  try {
+    const { email, code } = req.body;
+
+    if (!email || !code) {
+      return res.status(400).json({
+        success: false,
+        message: "Email y código son requeridos",
+        code: "MISSING_FIELDS",
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const userRes = await client.query(
+      `SELECT id, name, reset_token, reset_expires, is_verified FROM users WHERE email = $1`,
+      [email.toLowerCase().trim()]
+    );
+
+    if (userRes.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        success: false,
+        message: "Usuario no encontrado",
+        code: "USER_NOT_FOUND",
+      });
+    }
+
+    const user = userRes.rows[0];
+
+    if (user.is_verified) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        success: false,
+        message: "Email ya verificado. Puedes iniciar sesión.",
+        code: "ALREADY_VERIFIED",
+      });
+    }
+
+    if (user.reset_token !== code) {
+      await client.query("ROLLBACK");
+      return res.status(401).json({
+        success: false,
+        message: "Código de verificación inválido",
+        code: "INVALID_CODE",
+      });
+    }
+
+    if (new Date() > new Date(user.reset_expires)) {
+      await client.query("ROLLBACK");
+      return res.status(401).json({
+        success: false,
+        message: "Código expirado. Solicita uno nuevo.",
+        code: "CODE_EXPIRED",
+      });
+    }
+
+    await client.query(
+      `UPDATE users SET is_verified = true, reset_token = NULL, reset_expires = NULL WHERE id = $1`,
+      [user.id]
+    );
+    await client.query("COMMIT");
+
+    console.log(`[EMAIL VERIFIED] ${email}`);
+    return res.json({
+      success: true,
+      message: "Email verificado correctamente. Ya puedes iniciar sesión.",
+    });
+
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("[VERIFY EMAIL ERROR]", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error al verificar email",
+      code: "SERVER_ERROR",
+    });
+  } finally {
+    client.release();
+  }
+};
+
+// ============================================
+// 📝 REGISTRO PÚBLICO (requiere verificación)
+// ============================================
+exports.register = async (req, res) => {
+  const client = await db.connect();
+  try {
+    const { email, password, name, cedula, phone } = req.body;
+
+    if (!email || !password || !name || !cedula) {
+      return res.status(400).json({
+        success: false,
+        message: "Campos requeridos: email, password, name, cedula",
+        code: "MISSING_FIELDS",
+      });
+    }
+
+    if (!isValidEmail(email)) {
+      return res.status(400).json({
+        success: false,
+        message: "Formato de email inválido",
+        code: "INVALID_EMAIL",
+      });
+    }
+
+    if (!isStrongPassword(password)) {
+      return res.status(400).json({
+        success: false,
+        message: "La contraseña debe tener mínimo 8 caracteres, mayúsculas, minúsculas, números y un carácter especial",
+        code: "WEAK_PASSWORD",
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const existingEmail = await client.query(
+      "SELECT id FROM users WHERE email = $1",
+      [email.toLowerCase().trim()]
+    );
+    if (existingEmail.rowCount > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        success: false,
+        message: "El email ya está registrado",
+        code: "EMAIL_TAKEN",
+      });
+    }
+
+    const existingCedula = await client.query(
+      "SELECT id FROM users WHERE cedula = $1",
+      [cedula.trim()]
+    );
+    if (existingCedula.rowCount > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        success: false,
+        message: "La cédula ya está registrada",
+        code: "CEDULA_TAKEN",
+      });
+    }
+
+    const verificationCode = generateVerificationCode();
+    const codeExpiry       = new Date(Date.now() + VERIFICATION_CODE_EXPIRY);
+    const hashedPassword   = await bcrypt.hash(password, SALT_ROUNDS);
+
+    const userRes = await client.query(
+      `INSERT INTO users (email, password, name, cedula, phone, is_active, is_verified, reset_token, reset_expires)
+       VALUES ($1, $2, $3, $4, $5, true, false, $6, $7)
+       RETURNING id, email, name`,
+      [
+        email.toLowerCase().trim(),
+        hashedPassword,
+        name.trim(),
+        cedula.trim(),
+        phone?.trim() || null,
+        verificationCode,
+        codeExpiry,
+      ]
+    );
+
+    const newUser = userRes.rows[0];
+
+    // Asignar rol de usuario normal (role_id = 3)
+    await client.query(
+      "INSERT INTO user_roles (user_id, role_id) VALUES ($1, 3)",
+      [newUser.id]
+    );
+    await client.query("COMMIT");
+
+    try {
+      await sendVerificationEmail(newUser.email, verificationCode, newUser.name);
+      console.log(`[REGISTER] Verification email sent to ${newUser.email}`);
+    } catch (emailError) {
+      console.error("[REGISTER] Email send failed:", emailError.message);
+      // No fallar el registro si el email falla
+    }
+
+    return res.status(201).json({
+      success: true,
+      message: "Usuario registrado. Revisa tu email para verificar tu cuenta.",
+      data: {
+        id:                  newUser.id,
+        email:               newUser.email,
+        name:                newUser.name,
+        requiresVerification: true,
+      },
+    });
+
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("[REGISTER ERROR]", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error al registrar usuario",
+      code: "SERVER_ERROR",
+    });
+  } finally {
+    client.release();
+  }
+};
+
+// ============================================
+// 🔄 REENVIAR CÓDIGO DE VERIFICACIÓN
+// ============================================
+exports.resendVerificationCode = async (req, res) => {
+  const client = await db.connect();
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        message: "Email es requerido",
+        code: "MISSING_FIELDS",
+      });
+    }
+
+    await client.query("BEGIN");
+
+    const userRes = await client.query(
+      "SELECT id, name, is_verified FROM users WHERE email = $1",
+      [email.toLowerCase().trim()]
+    );
+
+    if (userRes.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        success: false,
+        message: "Usuario no encontrado",
+        code: "USER_NOT_FOUND",
+      });
+    }
+
+    const user = userRes.rows[0];
+
+    if (user.is_verified) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        success: false,
+        message: "Email ya verificado",
+        code: "ALREADY_VERIFIED",
+      });
+    }
+
+    const verificationCode = generateVerificationCode();
+    const codeExpiry       = new Date(Date.now() + VERIFICATION_CODE_EXPIRY);
+
+    await client.query(
+      `UPDATE users SET reset_token = $1, reset_expires = $2 WHERE id = $3`,
+      [verificationCode, codeExpiry, user.id]
+    );
+    await client.query("COMMIT");
+
+    await sendVerificationEmail(email, verificationCode, user.name);
+
+    return res.json({
+      success: true,
+      message: "Nuevo código enviado a tu email.",
+    });
+
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("[RESEND CODE ERROR]", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error al reenviar código",
+      code: "SERVER_ERROR",
+    });
+  } finally {
+    client.release();
+  }
+};
+
+// ============================================
+// 🔄 REFRESH TOKEN
+// ============================================
+exports.refreshToken = async (req, res) => {
+  const client = await db.connect();
+  try {
+    const { refreshToken } = req.body;
+
+    if (!refreshToken) {
+      return res.status(400).json({
+        success: false,
+        message: "Refresh token requerido",
+        code: "MISSING_TOKEN",
+      });
+    }
+
+    let decoded;
+    try {
+      decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET, {
+        issuer:   "alesteb-api",
+        audience: "alesteb-client",
+      });
+    } catch {
+      return res.status(401).json({
+        success: false,
+        message: "Refresh token inválido o expirado",
+        code: "INVALID_REFRESH_TOKEN",
+      });
+    }
+
+    const tokenHash = crypto.createHash("sha256").update(refreshToken).digest("hex");
+    const tokenRes  = await client.query(
+      `SELECT id FROM refresh_tokens
+       WHERE user_id = $1 AND token_hash = $2 AND revoked = false AND expires_at > NOW()`,
+      [decoded.id, tokenHash]
+    );
+
+    if (tokenRes.rowCount === 0) {
+      return res.status(401).json({
+        success: false,
+        message: "Refresh token inválido o revocado",
+        code: "TOKEN_REVOKED",
+      });
+    }
+
+    const userRes = await client.query(
+      "SELECT id, email, name, is_active FROM users WHERE id = $1",
+      [decoded.id]
+    );
+
+    if (userRes.rowCount === 0 || !userRes.rows[0].is_active) {
+      return res.status(401).json({
+        success: false,
+        message: "Usuario no encontrado o inactivo",
+        code: "USER_INACTIVE",
+      });
+    }
+
+    const user   = userRes.rows[0];
+    const { roles } = await getUserRoles(user.id);
+    const newAccessToken = generateAccessToken({
+      id:    user.id,
+      email: user.email,
+      name:  user.name,
+      roles,
+    });
+
+    return res.json({
+      success: true,
+      data: { accessToken: newAccessToken },
+    });
+
+  } catch (error) {
+    console.error("[REFRESH TOKEN ERROR]", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error en el servidor",
+      code: "SERVER_ERROR",
+    });
+  } finally {
+    client.release();
+  }
+};
+
+// ============================================
+// 🚪 LOGOUT
+// ============================================
+exports.logout = async (req, res) => {
+  const client = await db.connect();
+  try {
+    const { refreshToken } = req.body;
+    const userId = req.user?.id;
+
+    if (refreshToken) {
+      const tokenHash = crypto.createHash("sha256").update(refreshToken).digest("hex");
+      await client.query(
+        `UPDATE refresh_tokens SET revoked = true, revoked_at = NOW() WHERE token_hash = $1`,
+        [tokenHash]
+      );
+    }
+
+    if (userId) {
+      await client.query(
+        `UPDATE refresh_tokens SET revoked = true, revoked_at = NOW()
+         WHERE user_id = $1 AND revoked = false`,
+        [userId]
+      );
+    }
+
+    return res.json({ success: true, message: "Logout exitoso" });
+
+  } catch (error) {
+    console.error("[LOGOUT ERROR]", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error al cerrar sesión",
+      code: "SERVER_ERROR",
+    });
+  } finally {
+    client.release();
+  }
+};
+
+// ============================================
+// 👤 OBTENER PERFIL
+// ============================================
+exports.getProfile = async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const userRes = await db.query(
+      `SELECT id, email, name, phone, cedula, city, address, created_at, last_login
+       FROM users WHERE id = $1`,
+      [userId]
+    );
+
+    if (userRes.rowCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Usuario no encontrado",
+        code: "USER_NOT_FOUND",
+      });
+    }
+
+    const user      = userRes.rows[0];
+    const { roles } = await getUserRoles(userId);
+
+    return res.json({ success: true, data: { ...user, roles } });
+
+  } catch (error) {
+    console.error("[GET PROFILE ERROR]", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error al obtener perfil",
+      code: "SERVER_ERROR",
+    });
+  }
+};
+
+// ============================================
+// ✏️ ACTUALIZAR PERFIL PROPIO
+// ============================================
+exports.updateProfile = async (req, res) => {
+  const client = await db.connect();
+  try {
+    const userId = req.user.id;
+    const { name, phone, city, address } = req.body;
+
+    if (!name?.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "El nombre es requerido",
+        code: "MISSING_FIELDS",
+      });
+    }
+
+    await client.query(
+      `UPDATE users
+       SET name = $1, phone = $2, city = $3, address = $4, updated_at = NOW()
+       WHERE id = $5`,
+      [name.trim(), phone?.trim() || null, city?.trim() || null, address?.trim() || null, userId]
+    );
+
+    const updated = await client.query(
+      `SELECT id, email, name, phone, cedula, city, address FROM users WHERE id = $1`,
+      [userId]
+    );
+
+    return res.json({
+      success: true,
+      message: "Perfil actualizado correctamente",
+      data: updated.rows[0],
+    });
+
+  } catch (error) {
+    console.error("[UPDATE PROFILE ERROR]", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error al actualizar perfil",
+      code: "SERVER_ERROR",
+    });
+  } finally {
+    client.release();
+  }
+};
+
+// controllers/auth.controller.js
+// — Agregado al final del archivo existente —
+// Pega este método dentro del archivo auth.controller.js que ya tienes.
+
+// ============================================
+// 🔑 CAMBIAR CONTRASEÑA PROPIA
+// ============================================
+exports.changePassword = async (req, res) => {
+  const client = await db.connect();
+  try {
+    const userId = req.user.id;
+    const { currentPassword, newPassword } = req.body;
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({
+        success: false,
+        message: "Contraseña actual y nueva son requeridas",
+        code: "MISSING_FIELDS",
+      });
+    }
+
+    if (!isStrongPassword(newPassword)) {
+      return res.status(400).json({
+        success: false,
+        message: "La nueva contraseña debe tener mínimo 8 caracteres, mayúsculas, minúsculas, números y un carácter especial",
+        code: "WEAK_PASSWORD",
+      });
+    }
+
+    const userRes = await client.query(
+      "SELECT password FROM users WHERE id = $1",
+      [userId]
+    );
+
+    if (userRes.rowCount === 0) {
+      return res.status(404).json({ success: false, message: "Usuario no encontrado" });
+    }
+
+    const valid = await bcrypt.compare(currentPassword, userRes.rows[0].password);
+    if (!valid) {
+      return res.status(401).json({
+        success: false,
+        message: "La contraseña actual es incorrecta",
+        code: "INVALID_CURRENT_PASSWORD",
+      });
+    }
+
+    const hashed = await bcrypt.hash(newPassword, SALT_ROUNDS);
+    await client.query(
+      "UPDATE users SET password = $1, updated_at = NOW() WHERE id = $2",
+      [hashed, userId]
+    );
+
+    // Revocar todos los refresh tokens para forzar re-login en otros dispositivos
+    await client.query(
+      "UPDATE refresh_tokens SET revoked = true, revoked_at = NOW() WHERE user_id = $1 AND revoked = false",
+      [userId]
+    );
+
+    console.log(`[CHANGE PASSWORD] Usuario ID: ${userId}`);
+
+    return res.json({
+      success: true,
+      message: "Contraseña actualizada. Por seguridad, inicia sesión de nuevo en otros dispositivos.",
+    });
+  } catch (error) {
+    console.error("[CHANGE PASSWORD ERROR]", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error al cambiar contraseña",
+      code: "SERVER_ERROR",
+    });
+  } finally {
+    client.release();
+  }
+};
