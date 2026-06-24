@@ -69,13 +69,15 @@ const auth = async (req, res, next) => {
     }
 
     req.user = {
-      id:             decoded.id,
-      email:          decoded.email,
-      name:           decoded.name,
-      roles:          decoded.roles || [],
+      id:                 decoded.id,
+      email:              decoded.email,
+      name:               decoded.name,
+      roles:              decoded.roles || [],
+      avatar_url:         decoded.avatar_url || null,
+      avatar_public_id:   decoded.avatar_public_id || null,
       // Para sub-usuarios apunta al admin dueño; para admins raíz es null.
       // Uso: const adminId = req.user.owner_admin_id ?? req.user.id
-      owner_admin_id: owner_admin_id ?? null,
+      owner_admin_id:     owner_admin_id ?? null,
     };
 
     next();

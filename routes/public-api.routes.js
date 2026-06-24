@@ -8,9 +8,17 @@ const {
   auth,
   checkRateLimit,
 } = require("../middleware/auth.middleware");
+const authController = require("../controllers/auth.controller");
 const storefrontAuth  = require("../controllers/storefront.auth.controller");
 const reviewsCtrl     = require("../controllers/reviews.controller");
-const { createUpload } = require("../middleware/upload.middleware");
+const { createUpload, uploadAvatar } = require("../middleware/upload.middleware");
+
+router.post(
+  ["/auth/profile/photo", "/auth/profile/avatar"],
+  auth,
+  uploadAvatar.any(),
+  authController.uploadProfilePhoto
+);
 
 router.use(apiKeyAuth);
 
@@ -729,6 +737,9 @@ router.get("/auth/profile", auth, storefrontAuth.getProfile);
 
 // PUT  /public-api/v1/auth/profile  (requiere JWT del cliente)
 router.put("/auth/profile", auth, storefrontAuth.updateProfile);
+
+// POST /public-api/v1/auth/profile/photo  (requiere JWT del cliente)
+router.post(["/auth/profile/photo", "/auth/profile/avatar"], auth, uploadAvatar.any(), storefrontAuth.uploadProfilePhoto);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HISTORIAL Y ESTADÍSTICAS DEL USUARIO (requieren JWT de cliente)

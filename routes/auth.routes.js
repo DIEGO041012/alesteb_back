@@ -12,6 +12,7 @@ const router  = express.Router();
 
 const authController           = require("../controllers/auth.controller");
 const { auth, checkRateLimit } = require("../middleware/auth.middleware");
+const { uploadAvatar }         = require("../middleware/upload.middleware");
 
 // ============================================
 // 🔓 RUTAS PÚBLICAS
@@ -49,6 +50,7 @@ if (process.env.NODE_ENV !== "production") {
 router.post("/logout",     auth, authController.logout);
 router.get ("/profile",    auth, authController.getProfile);
 router.put ("/profile",    auth, authController.updateProfile);
+router.post(["/profile/photo", "/profile/avatar"], auth, uploadAvatar.any(), authController.uploadProfilePhoto);
 
 // Cambio de contraseña propio
 router.post("/change-password", auth, authController.changePassword);

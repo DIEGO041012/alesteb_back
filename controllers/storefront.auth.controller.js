@@ -8,6 +8,7 @@ const db     = require("../config/db");
 const bcrypt = require("bcryptjs");
 const jwt    = require("jsonwebtoken");
 const crypto = require("crypto");
+const cloudinary = require("../config/cloudinary");
 const { generateVerificationCode, sendVerificationEmail } = require("../config/emailConfig");
 
 const SALT_ROUNDS              = 12;
@@ -21,6 +22,14 @@ const isValidEmail = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
 
 const isStrongPassword = (p) =>
   p.length >= 8 && /[A-Z]/.test(p) && /[a-z]/.test(p) && /[0-9]/.test(p) && /[^A-Za-z0-9]/.test(p);
+
+const ensureAvatarColumns = async (client) => {
+  await client.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS avatar_url TEXT,
+    ADD COLUMN IF NOT EXISTS avatar_public_id TEXT
+  `);
+};
 
 const generateAccessToken = (payload) =>
   jwt.sign(payload, process.env.JWT_SECRET, {
@@ -598,14 +607,63 @@ exports.logout = async (req, res) => {
 };
 
 // ============================================================
-// 👤 PERFIL DEL CLIENTE
+// � SUBIR FOTO DE PERFIL
+// ============================================================
+exports.uploadProfilePhoto = async (req, res) => {
+  const client = await db.connect();
+  try {
+    const userId = req.user.id;
+
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ success: false, message: "No se recibió ninguna imagen", code: "NO_FILE" });
+    }
+
+    await ensureAvatarColumns(client);
+
+    const uploadedFile = req.file || req.files?.[0];
+    const avatarUrl = uploadedFile?.path || uploadedFile?.secure_url || null;
+    const publicId = uploadedFile?.filename || uploadedFile?.public_id || null;
+
+    if (!avatarUrl) {
+      return res.status(400).json({ success: false, message: "No se pudo obtener la URL pública de la imagen", code: "UPLOAD_FAILED" });
+    }
+
+    const previous = await client.query("SELECT avatar_public_id FROM users WHERE id = $1", [userId]);
+
+    if (previous.rows[0]?.avatar_public_id && previous.rows[0].avatar_public_id !== publicId) {
+      await cloudinary.uploader.destroy(previous.rows[0].avatar_public_id).catch(() => {});
+    }
+
+    await client.query(
+      `UPDATE users
+       SET avatar_url = $1, avatar_public_id = $2, updated_at = NOW()
+       WHERE id = $3`,
+      [avatarUrl, publicId, userId]
+    );
+
+    const updated = await client.query(
+      `SELECT id, email, name, phone, cedula, city, address, avatar_url FROM users WHERE id = $1`,
+      [userId]
+    );
+
+    return res.json({ success: true, message: "Foto de perfil actualizada correctamente", data: updated.rows[0] });
+  } catch (error) {
+    console.error("[STOREFRONT UPLOAD PROFILE PHOTO ERROR]", error);
+    return res.status(500).json({ success: false, message: "Error al subir la foto de perfil", code: "SERVER_ERROR" });
+  } finally {
+    client.release();
+  }
+};
+
+// ============================================================
+// �👤 PERFIL DEL CLIENTE
 // ============================================================
 exports.getProfile = async (req, res) => {
   try {
     const userId = req.user.id;
 
     const userRes = await db.query(
-      `SELECT id, email, name, phone, cedula, city, address, created_at, last_login
+      `SELECT id, email, name, phone, cedula, city, address, avatar_url, created_at, last_login
        FROM users WHERE id = $1`,
       [userId]
     );
@@ -677,7 +735,7 @@ exports.googleAuth = async (req, res) => {
 
     // 2. Buscar usuario existente (scopeado al tenant)
     let userRes = await client.query(
-      `SELECT id, email, name, phone, cedula, city, address, is_active
+      `SELECT id, email, name, phone, cedula, city, address, avatar_url, is_active
        FROM users
        WHERE email = $1 AND owner_admin_id = $2`,
       [email.toLowerCase().trim(), ownerAdminId]
@@ -813,7 +871,7 @@ exports.updateProfile = async (req, res) => {
     );
 
     const updated = await client.query(
-      "SELECT id, email, name, phone, cedula, city, address FROM users WHERE id = $1",
+      "SELECT id, email, name, phone, cedula, city, address, avatar_url FROM users WHERE id = $1",
       [userId]
     );
 

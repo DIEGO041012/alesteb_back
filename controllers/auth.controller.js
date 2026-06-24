@@ -3,6 +3,7 @@ const db     = require("../config/db");
 const bcrypt = require("bcryptjs");
 const jwt    = require("jsonwebtoken");
 const crypto = require("crypto");
+const cloudinary = require("../config/cloudinary");
 const { generateVerificationCode, sendVerificationEmail } = require("../config/emailConfig");
 
 // ============================================
@@ -23,6 +24,29 @@ const isStrongPassword = (password) =>
   /[a-z]/.test(password) &&
   /[0-9]/.test(password) &&
   /[^A-Za-z0-9]/.test(password);
+
+const ensureAvatarColumns = async (client) => {
+  await client.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS avatar_url TEXT,
+    ADD COLUMN IF NOT EXISTS avatar_public_id TEXT
+  `);
+};
+
+const buildProfilePayload = (user, roles = []) => ({
+  id: user.id,
+  email: user.email,
+  name: user.name || "Usuario",
+  phone: user.phone,
+  cedula: user.cedula,
+  city: user.city,
+  address: user.address,
+  avatar_url: user.avatar_url ?? null,
+  avatar_public_id: user.avatar_public_id ?? null,
+  created_at: user.created_at ?? null,
+  last_login: user.last_login ?? null,
+  roles,
+});
 
 // ============================================
 // 🎫 GENERACIÓN DE TOKENS
@@ -104,8 +128,8 @@ exports.login = async (req, res) => {
     await client.query("BEGIN");
 
     const userRes = await client.query(
-      `SELECT id, email, password, name, phone, cedula, city, address,
-              failed_login_attempts, locked_until, is_active, is_verified
+      `SELECT id, email, password, name, phone, cedula, city, address, avatar_url,
+              avatar_public_id, failed_login_attempts, locked_until, is_active, is_verified
        FROM users WHERE email = $1`,
       [email.toLowerCase().trim()]
     );
@@ -197,7 +221,14 @@ exports.login = async (req, res) => {
     );
 
     const { roles } = await getUserRoles(user.id);
-    const tokenPayload = { id: user.id, email: user.email, name: user.name, roles };
+    const tokenPayload = {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      roles,
+      avatar_url: user.avatar_url,
+      avatar_public_id: user.avatar_public_id,
+    };
     const accessToken  = generateAccessToken(tokenPayload);
     const refreshToken = generateRefreshToken({ id: user.id, email: user.email });
 
@@ -209,16 +240,7 @@ exports.login = async (req, res) => {
     return res.json({
       success: true,
       message: "Login exitoso",
-      user: {
-        id:      user.id,
-        email:   user.email,
-        name:    user.name || "Usuario",
-        phone:   user.phone,
-        cedula:  user.cedula,
-        city:    user.city,
-        address: user.address,
-        roles,
-      },
+      user: buildProfilePayload(user, roles),
       token: accessToken,
       refreshToken,
     });
@@ -783,14 +805,84 @@ exports.logout = async (req, res) => {
 };
 
 // ============================================
-// 👤 OBTENER PERFIL
+// � SUBIR FOTO DE PERFIL
+// ============================================
+exports.uploadProfilePhoto = async (req, res) => {
+  const client = await db.connect();
+  try {
+    const userId = req.user.id;
+
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No se recibió ninguna imagen",
+        code: "NO_FILE",
+      });
+    }
+
+    await ensureAvatarColumns(client);
+
+    const uploadedFile = req.file || req.files?.[0];
+    const avatarUrl = uploadedFile?.path || uploadedFile?.secure_url || null;
+    const publicId = uploadedFile?.filename || uploadedFile?.public_id || null;
+
+    if (!avatarUrl) {
+      return res.status(400).json({
+        success: false,
+        message: "No se pudo obtener la URL pública de la imagen",
+        code: "UPLOAD_FAILED",
+      });
+    }
+
+    const previous = await client.query(
+      "SELECT avatar_public_id FROM users WHERE id = $1",
+      [userId]
+    );
+
+    if (previous.rows[0]?.avatar_public_id && previous.rows[0].avatar_public_id !== publicId) {
+      await cloudinary.uploader.destroy(previous.rows[0].avatar_public_id).catch(() => {});
+    }
+
+    await client.query(
+      `UPDATE users
+       SET avatar_url = $1, avatar_public_id = $2, updated_at = NOW()
+       WHERE id = $3`,
+      [avatarUrl, publicId, userId]
+    );
+
+    const updated = await client.query(
+      `SELECT id, email, name, phone, cedula, city, address, avatar_url, avatar_public_id
+       FROM users WHERE id = $1`,
+      [userId]
+    );
+
+    return res.json({
+      success: true,
+      message: "Foto de perfil actualizada correctamente",
+      data: buildProfilePayload(updated.rows[0]),
+    });
+  } catch (error) {
+    console.error("[UPLOAD PROFILE PHOTO ERROR]", error);
+    return res.status(500).json({
+      success: false,
+      message: "Error al subir la foto de perfil",
+      code: "SERVER_ERROR",
+    });
+  } finally {
+    client.release();
+  }
+};
+
+// ============================================
+// �👤 OBTENER PERFIL
 // ============================================
 exports.getProfile = async (req, res) => {
   try {
     const userId = req.user.id;
 
     const userRes = await db.query(
-      `SELECT id, email, name, phone, cedula, city, address, created_at, last_login
+      `SELECT id, email, name, phone, cedula, city, address, avatar_url, avatar_public_id,
+              created_at, last_login
        FROM users WHERE id = $1`,
       [userId]
     );
@@ -806,7 +898,7 @@ exports.getProfile = async (req, res) => {
     const user      = userRes.rows[0];
     const { roles } = await getUserRoles(userId);
 
-    return res.json({ success: true, data: { ...user, roles } });
+    return res.json({ success: true, data: buildProfilePayload(user, roles) });
 
   } catch (error) {
     console.error("[GET PROFILE ERROR]", error);
@@ -843,14 +935,15 @@ exports.updateProfile = async (req, res) => {
     );
 
     const updated = await client.query(
-      `SELECT id, email, name, phone, cedula, city, address FROM users WHERE id = $1`,
+      `SELECT id, email, name, phone, cedula, city, address, avatar_url, avatar_public_id
+       FROM users WHERE id = $1`,
       [userId]
     );
 
     return res.json({
       success: true,
       message: "Perfil actualizado correctamente",
-      data: updated.rows[0],
+      data: buildProfilePayload(updated.rows[0]),
     });
 
   } catch (error) {
